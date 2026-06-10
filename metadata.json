@@ -1,0 +1,6 @@
+{
+  "name": "Veilwatch",
+  "description": "Veilwatch is a modern, high-fidelity native Android anime streaming & tracking application synchronized with AniList, MyAnimeList, and high-performance streaming servers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
