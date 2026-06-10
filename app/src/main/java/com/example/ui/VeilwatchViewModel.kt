@@ -23,7 +23,7 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
     private val _preferredServer = MutableStateFlow("HD-1")
     val preferredServer: StateFlow<String> = _preferredServer.asStateFlow()
 
-    private val _preferredCategory = MutableStateFlow("sub") // "sub" or "dub"
+    private val _preferredCategory = MutableStateFlow("sub")
     val preferredCategory: StateFlow<String> = _preferredCategory.asStateFlow()
 
     val adultContentEnabled: StateFlow<Boolean> = repository.getAdultContentEnabled()
@@ -98,7 +98,6 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
     private val _userProfileState = MutableStateFlow<UiState<UserProfile>>(UiState.Loading)
     val userProfileState: StateFlow<UiState<UserProfile>> = _userProfileState.asStateFlow()
 
-    // Sync watchlist with AniList if active
     private val _syncedWatchlistState = MutableStateFlow<List<WatchlistItem>>(emptyList())
     val syncedWatchlist: StateFlow<List<WatchlistItem>> = _syncedWatchlistState.asStateFlow()
 
@@ -107,7 +106,6 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
         refreshHomeFeed()
         loadGenres()
 
-        // Debounced search reactive stream
         viewModelScope.launch {
             _searchQuery
                 .debounce(300)
@@ -134,11 +132,8 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             try {
                 val list = repository.getGenresCollection()
-                if (list.isNotEmpty()) {
-                    _genreList.value = list
-                } else {
-                    _genreList.value = listOf("Action", "Adventure", "Comedy", "Drama", "Fantasy", "Sci-Fi", "Romance", "Mystery", "Slice of Life", "Supernatural")
-                }
+                _genreList.value = if (list.isNotEmpty()) list
+                else listOf("Action", "Adventure", "Comedy", "Drama", "Fantasy", "Sci-Fi", "Romance", "Mystery", "Slice of Life", "Supernatural")
             } catch (e: Exception) {
                 _genreList.value = listOf("Action", "Adventure", "Comedy", "Drama", "Fantasy", "Sci-Fi", "Romance", "Mystery", "Slice of Life", "Supernatural")
             }
@@ -155,36 +150,24 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
             } catch (e: Exception) {
                 _trendingState.value = UiState.Error(e.message ?: "Failed to load trending anime.")
             }
-
             try {
                 val popular = repository.getPopularAnime(1, 20)
                 _popularState.value = UiState.Success(popular)
             } catch (e: Exception) {
                 _popularState.value = UiState.Error(e.message ?: "Failed to load popular anime.")
             }
-
             try {
                 val animeHome = repository.getHiAnimeHome()
-                if (animeHome != null) {
-                    _hiAnimeHomeState.value = animeHome
-                }
-            } catch (e: Exception) {
-                // Ignore silent scraping fail
-            }
+                if (animeHome != null) _hiAnimeHomeState.value = animeHome
+            } catch (e: Exception) { }
         }
     }
 
-    fun updateSearchQuery(query: String) {
-        _searchQuery.value = query
-    }
+    fun updateSearchQuery(query: String) { _searchQuery.value = query }
 
     fun toggleGenreFilter(genre: String) {
         val current = _selectedGenres.value.toMutableList()
-        if (current.contains(genre)) {
-            current.remove(genre)
-        } else {
-            current.add(genre)
-        }
+        if (current.contains(genre)) current.remove(genre) else current.add(genre)
         _selectedGenres.value = current
         performSearch(_searchQuery.value, current)
     }
@@ -210,9 +193,57 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // --- FIX: Episode matching pakai fuzzy/contains, bukan strict equals ---
+    private fun findBestHiAnimeMatch(
+        results: List<HiAnimeAnimeDto>,
+        titleRomaji: String?,
+        titleEnglish: String?
+    ): HiAnimeAnimeDto? {
+        if (results.isEmpty()) return null
+
+        // 1. Exact match (case insensitive)
+        val exact = results.firstOrNull { r ->
+            r.name.equals(titleRomaji, ignoreCase = true) ||
+            r.name.equals(titleEnglish, ignoreCase = true)
+        }
+        if (exact != null) return exact
+
+        // 2. Contains match
+        val contains = results.firstOrNull { r ->
+            val name = r.name.lowercase()
+            (titleRomaji != null && name.contains(titleRomaji.lowercase())) ||
+            (titleEnglish != null && name.contains(titleEnglish.lowercase())) ||
+            (titleRomaji != null && titleRomaji.lowercase().contains(name)) ||
+            (titleEnglish != null && titleEnglish.lowercase().contains(name))
+        }
+        if (contains != null) return contains
+
+        // 3. Word overlap match
+        val romajiWords = titleRomaji?.lowercase()?.split(" ")?.filter { it.length > 2 } ?: emptyList()
+        val englishWords = titleEnglish?.lowercase()?.split(" ")?.filter { it.length > 2 } ?: emptyList()
+        val wordMatch = results.maxByOrNull { r ->
+            val rName = r.name.lowercase()
+            val romajiScore = romajiWords.count { rName.contains(it) }
+            val englishScore = englishWords.count { rName.contains(it) }
+            maxOf(romajiScore, englishScore)
+        }
+        val wordMatchScore = wordMatch?.let { r ->
+            val rName = r.name.lowercase()
+            maxOf(
+                romajiWords.count { rName.contains(it) },
+                englishWords.count { rName.contains(it) }
+            )
+        } ?: 0
+        if (wordMatchScore > 0) return wordMatch
+
+        // 4. Fallback ke hasil pertama
+        return results.firstOrNull()
+    }
+
     fun loadAnimeDetail(id: Int) {
         viewModelScope.launch {
             _detailState.value = UiState.Loading
+            _activeEpisodes.value = emptyList()
             _malEpisodes.value = emptyList()
             _malNews.value = emptyList()
             try {
@@ -220,32 +251,33 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
                 if (detail != null) {
                     _detailState.value = UiState.Success(detail)
                     _activeAnime.value = detail.media
-                    
-                    // Trigger MAL background loads using MAL id
+
                     detail.media.idMal?.let { malId ->
                         launch {
-                            val eps = repository.getMALEpisodes(malId)
-                            _malEpisodes.value = eps
+                            _malEpisodes.value = repository.getMALEpisodes(malId)
                         }
                         launch {
-                            val news = repository.getMALNews(malId)
-                            _malNews.value = news
+                            _malNews.value = repository.getMALNews(malId)
                         }
                     }
 
-                    // Preload corresponding streaming matches over HiAnime
+                    // FIX: Pakai fuzzy matching untuk cari episode di HiAnime
                     launch {
                         val keyword = detail.media.titleRomaji ?: detail.media.titleEnglish ?: ""
                         if (keyword.isNotEmpty()) {
-                            val scrapeResults = repository.searchHiAnime(keyword)
-                            val matched = scrapeResults.firstOrNull { result ->
-                                result.name.equals(detail.media.titleRomaji, ignoreCase = true) ||
-                                result.name.equals(detail.media.titleEnglish, ignoreCase = true)
-                            } ?: scrapeResults.firstOrNull()
-
-                            matched?.id?.let { matchedAnimeId ->
-                                val eps = repository.getHiAnimeEpisodes(matchedAnimeId)
-                                _activeEpisodes.value = eps
+                            try {
+                                val scrapeResults = repository.searchHiAnime(keyword)
+                                val matched = findBestHiAnimeMatch(
+                                    scrapeResults,
+                                    detail.media.titleRomaji,
+                                    detail.media.titleEnglish
+                                )
+                                matched?.id?.let { matchedAnimeId ->
+                                    val eps = repository.getHiAnimeEpisodes(matchedAnimeId)
+                                    _activeEpisodes.value = eps
+                                }
+                            } catch (e: Exception) {
+                                // Episode load fail — biarkan kosong, tidak crash
                             }
                         }
                     }
@@ -265,59 +297,50 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
         _skipTimes.value = emptyList()
 
         viewModelScope.launch {
-            // 1. Fetch servers
             val serversData = repository.getHiAnimeServers(episode.episodeId)
             _servers.value = serversData
 
-            // 2. Fetch stream sources
             val prefSvr = _preferredServer.value
             val category = _preferredCategory.value
             val streams = repository.getHiAnimeSources(episode.episodeId, prefSvr, category)
             if (streams != null) {
                 _streamSources.value = streams
             } else if (serversData != null) {
-                // Fallback to whichever server exists
                 val fallbackServer = serversData.sub?.firstOrNull()?.serverName ?: "HD-1"
                 _activeServer.value = fallbackServer
-                val fallbackStreams = repository.getHiAnimeSources(episode.episodeId, fallbackServer, category)
-                _streamSources.value = fallbackStreams
+                _streamSources.value = repository.getHiAnimeSources(episode.episodeId, fallbackServer, category)
             }
 
-            // 3. Fetch skip times from Jikan match
-            _activeAnime.value?.let { info ->
-                info.idMal?.let { malId ->
-                    val skips = repository.getAniSkipTimes(malId, episode.number)
-                    _skipTimes.value = skips
-                }
+            _activeAnime.value?.idMal?.let { malId ->
+                _skipTimes.value = repository.getAniSkipTimes(malId, episode.number)
             }
         }
     }
 
     fun changeStreamingServer(serverName: String) {
-        _activeServer.value = serverName
-        val ep = _currentPlayEpisode.value ?: return
         viewModelScope.launch {
+            // FIX: Simpan ke database supaya persist
+            repository.savePreferredStreamServer(serverName)
+            _preferredServer.value = serverName
+            _activeServer.value = serverName
+            val ep = _currentPlayEpisode.value ?: return@launch
             _streamSources.value = null
-            val streams = repository.getHiAnimeSources(ep.episodeId, serverName, _preferredCategory.value)
-            _streamSources.value = streams
+            _streamSources.value = repository.getHiAnimeSources(ep.episodeId, serverName, _preferredCategory.value)
         }
     }
 
-    fun toggleSubDub(category: String) { // "sub" or "dub"
+    fun toggleSubDub(category: String) {
         viewModelScope.launch {
             repository.savePreferredStreamCategory(category)
             _preferredCategory.value = category
             val ep = _currentPlayEpisode.value ?: return@launch
             _streamSources.value = null
-            val streams = repository.getHiAnimeSources(ep.episodeId, _activeServer.value, category)
-            _streamSources.value = streams
+            _streamSources.value = repository.getHiAnimeSources(ep.episodeId, _activeServer.value, category)
         }
     }
 
-    // --- WATCHLIST & SYNC API IMPLEMENTATION ---
     fun updateWatchlist(anime: AnimeMedia, status: String, score: Double, progress: Int) {
         viewModelScope.launch {
-            // Save locally
             repository.saveToLocalWatchlist(
                 id = anime.id,
                 title = anime.titleRomaji ?: anime.titleEnglish ?: "Anime",
@@ -326,8 +349,6 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
                 score = score,
                 progress = progress
             )
-
-            // Save to AniList if token exists
             if (_aniListToken.value != null) {
                 repository.saveWatchlistEntryToAniList(anime.id, status, score, progress)
                 refreshUserWatchlist()
@@ -337,23 +358,17 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun toggleFavorite(animeId: Int) {
         viewModelScope.launch {
-            if (_aniListToken.value != null) {
-                repository.toggleAniListFavourite(animeId)
-            }
+            if (_aniListToken.value != null) repository.toggleAniListFavourite(animeId)
         }
     }
 
     fun deleteWatchlistItem(id: Int) {
         viewModelScope.launch {
             repository.deleteFromLocalWatchlist(id)
-            if (_aniListToken.value != null) {
-                // In AniList, deletion can be done or updating to planning
-                refreshUserWatchlist()
-            }
+            if (_aniListToken.value != null) refreshUserWatchlist()
         }
     }
 
-    // --- WATCH HISTORY METRIC LOGGER ---
     fun logWatchHistory(animeId: Int, progressSeconds: Long, durationSeconds: Long) {
         val anime = _activeAnime.value ?: return
         val ep = _currentPlayEpisode.value?.number ?: 1
@@ -370,12 +385,10 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun deleteHistory() {
-        viewModelScope.launch {
-            repository.clearHistory()
-        }
+        viewModelScope.launch { repository.clearHistory() }
     }
 
-    // --- SETTINGS PREFERENCES TRIGGERS ---
+    // FIX: Settings tersimpan ke DB
     fun updateTitleLang(lang: String) {
         viewModelScope.launch {
             repository.savePreferredTitleLang(lang)
@@ -384,12 +397,9 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateAdultContent(enabled: Boolean) {
-        viewModelScope.launch {
-            repository.saveAdultContentEnabled(enabled)
-        }
+        viewModelScope.launch { repository.saveAdultContentEnabled(enabled) }
     }
 
-    // --- ANILIST AUTH LOGINS ---
     fun authenticateAniList(token: String) {
         viewModelScope.launch {
             repository.saveAniListToken(token)
@@ -418,11 +428,8 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
             _userProfileState.value = UiState.Loading
             try {
                 val profile = repository.getViewerProfile()
-                if (profile != null) {
-                    _userProfileState.value = UiState.Success(profile)
-                } else {
-                    _userProfileState.value = UiState.Error("Failed to parse Viewer Profile")
-                }
+                _userProfileState.value = if (profile != null) UiState.Success(profile)
+                else UiState.Error("Failed to parse Viewer Profile")
             } catch (e: Exception) {
                 _userProfileState.value = UiState.Error(e.message ?: "Authentication expired")
             }
@@ -433,16 +440,9 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
         if (_aniListToken.value == null) return
         viewModelScope.launch {
             try {
-                val activeList = repository.getViewerWatchlist("CURRENT")
-                val completedList = repository.getViewerWatchlist("COMPLETED")
-                val planningList = repository.getViewerWatchlist("PLANNING")
-                val onHoldList = repository.getViewerWatchlist("ON_HOLD")
-                val droppedList = repository.getViewerWatchlist("DROPPED")
-
-                val totalList = activeList + completedList + planningList + onHoldList + droppedList
+                val totalList = listOf("CURRENT", "COMPLETED", "PLANNING", "ON_HOLD", "DROPPED")
+                    .flatMap { repository.getViewerWatchlist(it) }
                 _syncedWatchlistState.value = totalList
-
-                // Synchronize locally as well
                 totalList.forEach { item ->
                     repository.saveToLocalWatchlist(
                         id = item.id,
@@ -453,9 +453,7 @@ class VeilwatchViewModel(application: Application) : AndroidViewModel(applicatio
                         progress = item.progress
                     )
                 }
-            } catch (e: Exception) {
-                // Fallback to local on connection drop
-            }
+            } catch (e: Exception) { }
         }
     }
 }
